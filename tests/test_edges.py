@@ -10,6 +10,53 @@ from zippeek.archive import inspect_archive, verify
 
 
 class EdgeTests(unittest.TestCase):
+    def test_stored_size_smaller_than_payload_is_error(self):
+        import zlib
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, 'wrong-size.zip')
+            with zipfile.ZipFile(path, 'w') as archive:
+                archive.writestr('file', b'abc')
+            data = bytearray(path.read_bytes())
+            central = data.index(b'PK\x01\x02')
+            struct.pack_into('<I', data, 22, 1)
+            struct.pack_into('<I', data, central+24, 1)
+            struct.pack_into('<I', data, 14, zlib.crc32(b'a'))
+            struct.pack_into('<I', data, central+16, zlib.crc32(b'a'))
+            path.write_bytes(data)
+            result = verify(inspect_archive(path), threading.Event())
+            self.assertEqual(result.statuses, {0:'error'})
+            self.assertFalse(result.complete)
+
+    def test_declared_length_larger_than_read_data_is_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, 'wrong-size.zip')
+            with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('file', b'abc')
+            data = bytearray(path.read_bytes())
+            central = data.index(b'PK\x01\x02')
+            struct.pack_into('<I', data, 22, 30)
+            struct.pack_into('<I', data, central+24, 30)
+            path.write_bytes(data)
+            result = verify(inspect_archive(path), threading.Event())
+            self.assertEqual(result.statuses, {0:'error'})
+            self.assertFalse(result.complete)
+            self.assertIn('Размер записи', result.errors[0])
+
+    def test_path_replaced_while_old_handle_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, 'archive.zip')
+            with zipfile.ZipFile(path, 'w') as archive:
+                archive.writestr('file', b'abc')
+            snapshot = inspect_archive(path)
+            real_stat = path.stat()
+            from types import SimpleNamespace
+            changed_stat = SimpleNamespace(st_dev=real_stat.st_dev, st_ino=real_stat.st_ino+1,
+                                           st_size=real_stat.st_size, st_mtime_ns=real_stat.st_mtime_ns)
+            from zippeek.archive import ArchiveChanged
+            with patch('zippeek.archive.os.stat', return_value=changed_stat):
+                with self.assertRaises(ArchiveChanged):
+                    verify(snapshot, threading.Event())
+
     def test_crc_failure_reserves_budget(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder, 'broken.zip')

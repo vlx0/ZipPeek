@@ -34,6 +34,15 @@ def summary(check, count):
     return f'{state} · OK: {verified} / {count} · ошибки: {issues} · не проверено: {count-verified-issues}', BAD if issues else WARN
 
 
+def filtered_members(archive, check, query='', attention=False):
+    if archive is None:
+        return []
+    query = query.casefold()
+    return [member for member in archive.members
+            if query in member.name.casefold()
+            and (not attention or check is None or check.statuses.get(member.index) != 'ok')]
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -47,6 +56,8 @@ class App(tk.Tk):
         self.archive = None
         self.check = None
         self.filter_job = None
+        self.insert_job = None
+        self.poll_job = None
         self.generation = 0
         self.shown = {}
         try:
@@ -116,6 +127,9 @@ class App(tk.Tk):
         tk.Label(filter_line, text='Содержимое', bg=BG, fg=FG, font=('Segoe UI Semibold', 11)).pack(side='left')
         tk.Label(filter_line, text='Фильтр по имени', bg=BG, fg=MUTED).pack(side='left', padx=(20,8))
         self.query = tk.StringVar()
+        self.attention = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filter_line, text='Требуют внимания', variable=self.attention,
+                        command=self.render, cursor='hand2').pack(side='right', padx=(12,0))
         ttk.Entry(filter_line, textvariable=self.query).pack(side='left', fill='x', expand=True)
         self.query.trace_add('write', self.filter_changed)
         self.path.trace_add('write', self.invalidate)
@@ -127,6 +141,9 @@ class App(tk.Tk):
         lower = tk.Frame(pad, bg=BG)
         lower.pack(side='bottom', fill='x', pady=(10,0))
         ttk.Button(lower, text='Копировать имя', command=self.copy_name).pack(side='left')
+        self.report_button = ttk.Button(lower, text='Копировать отчёт', command=self.copy_report,
+                                       state='disabled', cursor='hand2')
+        self.report_button.pack(side='right', padx=(10,0))
         self.detail = tk.StringVar(value='Выберите запись, чтобы увидеть подробности')
         ttk.Entry(lower, textvariable=self.detail, state='readonly').pack(side='left', fill='x', expand=True, padx=(10,0))
         table = tk.Frame(pad, bg=EDGE, padx=1, pady=1)
@@ -152,7 +169,7 @@ class App(tk.Tk):
                               fg=MUTED, font=('Segoe UI', 11), justify='center')
         self.empty.place(relx=.5, rely=.52, anchor='center')
         self.protocol('WM_DELETE_WINDOW', self.close)
-        self.after(80, self.poll)
+        self.poll_job = self.after(80, self.poll)
 
     def configure_style(self):
         style = ttk.Style(self)
@@ -189,6 +206,10 @@ class App(tk.Tk):
                         borderwidth=0, lightcolor=ACCENT, darkcolor=ACCENT, thickness=3)
         style.configure('TCombobox', padding=6, arrowcolor=FG)
         style.map('TCombobox', fieldbackground=[('readonly',CARD)], foreground=[('readonly',FG)])
+        style.configure('TCheckbutton', background=BG, foreground=MUTED, padding=(4,6),
+                        indicatorbackground=CARD, indicatorforeground=FG)
+        style.map('TCheckbutton', background=[('active',BG)], foreground=[('selected',FG)],
+                  indicatorbackground=[('selected','#5278ad')])
 
     def choose(self):
         path = filedialog.askopenfilename(parent=self, filetypes=[('ZIP-архивы','*.zip'), ('Все файлы','*.*')])
@@ -205,11 +226,15 @@ class App(tk.Tk):
         self.packed.set('—')
         self.unpacked.set('—')
         self.check_button.configure(state='disabled')
+        self.report_button.configure(state='disabled')
         self.status.set('Нажмите «Открыть», чтобы прочитать содержимое.')
         self.status_label.configure(fg=MUTED)
         self.empty.configure(text='Архив ещё не открыт')
 
     def clear(self):
+        if self.insert_job is not None:
+            self.after_cancel(self.insert_job)
+            self.insert_job = None
         self.generation += 1
         self.tree.delete(*self.tree.get_children())
         self.shown.clear()
@@ -221,6 +246,7 @@ class App(tk.Tk):
         for widget in (self.path_entry, self.load_button, self.browse):
             widget.configure(state='disabled' if busy else 'normal')
         self.check_button.configure(state='normal' if self.archive and not busy else 'disabled')
+        self.report_button.configure(state='normal' if self.archive and not busy else 'disabled')
         self.stop_button.configure(state='normal' if busy else 'disabled')
         self.limit_box.configure(state='disabled' if busy else 'readonly')
         if busy:
@@ -277,6 +303,7 @@ class App(tk.Tk):
         self.work('checked', lambda: verify(snapshot, self.stop, limit, progress))
 
     def poll(self):
+        self.poll_job = None
         for _ in range(40):
             try:
                 kind, data = self.events.get_nowait()
@@ -310,7 +337,7 @@ class App(tk.Tk):
                 if self.archive is None:
                     self.empty.configure(text='Архив не прочитан\n\nОн может быть повреждён или недоступен')
             self.set_busy(False)
-        self.after(80, self.poll)
+        self.poll_job = self.after(80, self.poll)
 
     def filter_changed(self, *_):
         if self.filter_job is not None:
@@ -324,10 +351,16 @@ class App(tk.Tk):
         self.clear()
         if self.archive is None:
             return
-        query = self.query.get().casefold()
-        members = [member for member in self.archive.members if query in member.name.casefold()]
+        query = self.query.get()
+        members = filtered_members(self.archive, self.check, query, self.attention.get())
         if not members:
-            self.empty.configure(text='Нет совпадений с фильтром' if query else 'Архив пуст')
+            if not self.archive.members:
+                text = 'Архив пуст'
+            elif query:
+                text = 'Нет совпадений с выбранными фильтрами'
+            else:
+                text = 'Все записи прошли проверку'
+            self.empty.configure(text=text)
             return
         self.empty.place_forget()
         self.insert_batch(members, 0, self.generation)
@@ -335,6 +368,7 @@ class App(tk.Tk):
     def insert_batch(self, members, offset, generation):
         if generation != self.generation:
             return
+        self.insert_job = None
         for position, member in enumerate(members[offset:offset+200], start=offset):
             state = self.check.statuses.get(member.index) if self.check else None
             label = STATUS.get(state, 'Нужен пароль' if member.encrypted else 'Не проверено')
@@ -344,7 +378,7 @@ class App(tk.Tk):
                                                        format_size(member.packed), label), tags=tags)
             self.shown[key] = member
         if offset+200 < len(members):
-            self.after(1, self.insert_batch, members, offset+200, generation)
+            self.insert_job = self.after(1, self.insert_batch, members, offset+200, generation)
 
     def select(self, _event=None):
         selected = self.tree.selection()
@@ -352,24 +386,65 @@ class App(tk.Tk):
         if member:
             error = self.check.errors.get(member.index, '') if self.check else ''
             self.detail.set(clean(member.name + (' · '+error if error else f' · метод {member.method}')))
+        else:
+            self.detail.set('Выберите запись, чтобы увидеть подробности')
         return member
 
     def copy_name(self):
         member = self.select()
         if member:
+            self.set_clipboard(member.name, 'Имя скопировано')
+
+    def set_clipboard(self, text, success):
+        try:
             self.clipboard_clear()
-            self.clipboard_append(member.name)
+            self.clipboard_append(text)
+        except (tk.TclError, UnicodeError):
+            self.detail.set('Не удалось скопировать. Буфер обмена может быть занят — повторите.')
+            return False
+        self.detail.set(success)
+        return True
+
+    def report_text(self):
+        if self.archive is None:
+            return ''
+        members = filtered_members(self.archive, self.check, self.query.get(), self.attention.get())
+        state = summary(self.check, len(self.archive.members))[0] if self.check else 'Целостность не проверена'
+        lines = ['ZipPeek', 'Архив: '+json.dumps(self.archive.path, ensure_ascii=False), state,
+                 'Состояние окна: '+clean(self.status.get()),
+                 f'На диске: {format_size(self.archive.packed)} · после распаковки (заявлено): {format_size(self.archive.size)}',
+                 f'Записей всего: {len(self.archive.members)} · в отчёте: {len(members)}',
+                 'Фильтр имени: '+json.dumps(self.query.get(), ensure_ascii=False),
+                 'Требуют внимания: '+('да' if self.attention.get() else 'нет'), '',
+                 '№\tРезультат\tРазмер\tСжато\tИмя (JSON)\tПодробности (JSON)']
+        for member in members:
+            status = self.check.statuses.get(member.index) if self.check else None
+            label = STATUS.get(status, 'Нужен пароль' if member.encrypted else 'Не проверено')
+            error = self.check.errors.get(member.index, '') if self.check else ''
+            lines.append(f'{member.index+1}\t{label}\t{member.size}\t{member.packed}\t'
+                         +json.dumps(member.name, ensure_ascii=False)+'\t'+json.dumps(error, ensure_ascii=False))
+        return '\n'.join(lines)
+
+    def copy_report(self):
+        if self.archive is None or self.busy:
+            return
+        text = self.report_text()
+        self.set_clipboard(text, 'Отчёт скопирован · учтены текущие фильтры')
 
     def close(self):
         self.stop.set()
-        if self.filter_job:
-            self.after_cancel(self.filter_job)
+        self.progress.stop()
+        for callback in (self.filter_job, self.insert_job, self.poll_job):
+            if callback is not None:
+                self.after_cancel(callback)
+        self.filter_job = self.insert_job = self.poll_job = None
         try:
             SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS.write_text(json.dumps({'path':self.path.get(), 'limit':self.limit.get()}, ensure_ascii=False), encoding='utf-8')
-        except OSError:
+            SETTINGS.write_text(json.dumps({'path':self.path.get(), 'limit':self.limit.get()}, ensure_ascii=True), encoding='utf-8')
+        except (OSError, UnicodeError, ValueError):
             pass
-        self.destroy()
+        finally:
+            self.destroy()
 
 
 def run():
